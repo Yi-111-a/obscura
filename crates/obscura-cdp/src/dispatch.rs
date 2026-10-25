@@ -64,6 +64,8 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) dom_documents: HashMap<Option<String>, domains::dom::DomDocument>,
+    pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -178,6 +180,8 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
+            dom_documents: HashMap::new(),
+            pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -222,7 +226,7 @@ impl CdpContext {
             storage_dir,
             allow_private_network,
         );
-        ctx.allow_file_access = allow_file_access;
+        ctx.set_allow_file_access(allow_file_access);
         Self::new_with_shared_context(Arc::new(ctx))
     }
 
@@ -331,6 +335,8 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.dom_documents.retain(|_, document| document.page_id != id);
+        self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -339,7 +345,12 @@ impl CdpContext {
             .collect();
         self.pages.retain(|p| p.id != id);
         self.current_loader_ids.remove(id);
+        self.nav_events_emitted.remove(id);
         self.announced_frames.remove(id);
+        self.binding_sessions.retain(|_, owners| {
+            owners.retain(|owner| !removed_sessions.contains(owner));
+            !owners.is_empty()
+        });
         #[cfg(feature = "render")]
         {
             for session_id in &removed_sessions {
@@ -409,6 +420,13 @@ impl CdpContext {
         frame_id: &str,
         origin: &str,
     ) -> Vec<ExecutionContextRecord> {
+        self.dom_documents.retain(|session, document| {
+            if document.page_id != page_id { return true; }
+            self.pending_events.push(CdpEvent {
+                method: "DOM.documentUpdated".into(), params: json!({}), session_id: session.clone(),
+            });
+            false
+        });
         if let Some(previous) = self.page_contexts.remove(page_id) {
             for id in previous {
                 self.execution_contexts.remove(&id);
@@ -679,6 +697,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.setLifecycleEventsEnabled"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
+            | "Page.setBypassCSP"
             | "Page.getNavigationHistory"
             | "Page.resetNavigationHistory"
             | "Page.captureSnapshot"
@@ -718,6 +737,14 @@ fn is_v8_free_method(method: &str) -> bool {
 }
 
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
+    dispatch_with_deferred(req, ctx, None).await
+}
+
+pub(crate) async fn dispatch_with_deferred(
+    req: &CdpRequest,
+    ctx: &mut CdpContext,
+    deferred: Option<&mut Option<domains::runtime::DeferredEvaluation>>,
+) -> CdpResponse {
     // headless_chrome (and older Puppeteer) wrap every CDP call inside
     // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
     // per-connection V8 lock — the recursive dispatch will acquire it for the
@@ -796,6 +823,18 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
             domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await
+        }
+        "Runtime" if deferred.is_some() && matches!(method, "evaluate" | "callFunctionOn")
+            && req.params.get("awaitPromise").and_then(|value| value.as_bool()) == Some(true) => {
+            match domains::runtime::start_awaited_evaluation(method, &req.params, ctx, &req.session_id, cmd_budget_ms).await {
+                Ok(Some(evaluation)) if evaluation.ready(ctx) => evaluation.finish(ctx, &req.session_id).await,
+                Ok(Some(evaluation)) => {
+                    *deferred.unwrap() = Some(evaluation);
+                    Ok(json!({}))
+                }
+                Ok(None) => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
+                Err(error) => Err(error),
+            }
         }
         "Runtime" => domains::runtime::handle(method, &req.params, ctx, &req.session_id).await,
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
@@ -1209,6 +1248,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn remove_page_releases_per_page_connection_state() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions.insert("s1".into(), page_id.clone());
+        ctx.nav_events_emitted.insert(page_id.clone());
+        ctx.binding_sessions.insert("only".into(), vec!["s1".into()]);
+        ctx.binding_sessions.insert("shared".into(), vec!["s1".into(), "other".into()]);
+        ctx.remove_page(&page_id);
+        assert!(ctx.nav_events_emitted.is_empty());
+        assert!(!ctx.binding_sessions.contains_key("only"));
+        assert_eq!(ctx.binding_sessions["shared"], vec!["other".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn heap_profiler_collect_garbage_reclaims_unreferenced_objects() {
         let mut ctx = CdpContext::new();
         let page_id = ctx.create_page();
@@ -1238,6 +1291,32 @@ mod tests {
         assert!(
             resp.error.is_none(),
             "Audits.enable should not error: {:?}",
+            resp.error
+        );
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
+    // Playwright sends Page.setBypassCSP for every new page of a context
+    // created with `bypassCSP: true`; an unknown-method error there fails
+    // page creation outright (changedetection.io always sets it).
+    #[tokio::test]
+    async fn page_set_bypass_csp_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("bypass-csp".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let resp = dispatch(
+            &CdpRequest {
+                session_id: session,
+                params: json!({"enabled": true}),
+                ..req("Page.setBypassCSP")
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "Page.setBypassCSP should not error: {:?}",
             resp.error
         );
         assert_eq!(resp.result, Some(json!({})));
